@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════
+# LeetTrack — System Requirements & Dependencies
+# ═══════════════════════════════════════════════════════════════
+
+# ── System ────────────────────────────────────────────────────
+# Node.js       v18+   (recommended: v20 LTS)
+# npm           v9+    (bundled with Node)
+# OS            Linux / macOS / Windows
+
+# ── Backend (server/) ─────────────────────────────────────────
+# Install:  cd server && npm install
+express==4.18.3              # Web framework
+better-sqlite3==9.4.3        # SQLite3 driver (zero-config, file-based DB)
+dotenv==16.4.5               # .env file loader
+cors==2.8.5                  # Cross-origin resource sharing
+bcryptjs==3.0.3              # Password hashing
+jsonwebtoken==9.0.3          # JWT auth tokens
+node-fetch==2.7.0            # HTTP client for LeetCode GraphQL proxy
+@google/generative-ai==0.21.0  # Gemini API SDK (optional, for LLM scoring)
+nodemon==3.1.0               # Dev: auto-restart on file changes (devDep)
+
+# ── Frontend (client/) ───────────────────────────────────────
+# Install:  cd client && npm install
+react==19.2.4                # UI library
+react-dom==19.2.4            # React DOM renderer
+react-router-dom==7.14.0     # Client-side routing
+vite==8.0.4                  # Build tool & dev server (devDep)
+@vitejs/plugin-react==6.0.1  # React fast-refresh for Vite (devDep)
+tailwindcss==4.2.2           # Utility CSS (used minimally — dark theme is vanilla CSS) (devDep)
+@tailwindcss/vite==4.2.2     # Tailwind Vite integration (devDep)
+eslint==9.39.4               # Linter (devDep)
+
+# ── Database ──────────────────────────────────────────────────
+# SQLite3 (embedded via better-sqlite3)
+# Data file:  db/leettrack.db  (auto-created on first run)
+# WAL mode enabled for concurrent read/write
+
+# ── External APIs ────────────────────────────────────────────
+# LeetCode GraphQL API   — problem search (proxied through server)
+# Google Gemini 2.0 Flash — solution analysis (optional, free tier: 1500 req/day)
+
+# ── Environment Variables (server/.env) ──────────────────────
+# GEMINI_API_KEY=your_key_here   (optional — app works without it)
+# JWT_SECRET=your_secret_here    (required — used for auth tokens)
+# PORT=3001                      (optional — defaults to 3001)

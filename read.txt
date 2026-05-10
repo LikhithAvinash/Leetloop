@@ -1,0 +1,790 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LeetTrack — Complete System Blueprint (v2)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Last Updated: 2026-04-13
+# This document is the single source of truth for both backend and frontend.
+# A senior engineer should be able to fully understand and maintain the system
+# from this file alone.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+## 1. System Overview
+
+LeetTrack is a personal web app that applies spaced repetition (same algorithm as
+Anki) to LeetCode problems. Problems are tracked across two brackets, scored 0–6
+based on how well you solved them, and scheduled for daily revision. The better
+you solve a problem, the longer before you see it again. Problems you struggle
+with come back sooner.
+
+Architecture: Monolithic client-server.
+- Frontend: React + Vite (SPA, client-side routing)
+- Backend: Node.js + Express (REST API)
+- Database: SQLite (file-based, zero-config)
+- Auth: JWT (30-day expiry, stored in localStorage)
+- Data Sync: Server-side user_data table for cross-device progress sync
+
+---
+
+## 2. Authentication System
+
+**JWT-based auth with per-user data isolation.**
+
+- Register: POST /api/auth/register → {username, email, password} → bcrypt hash → JWT token
+- Login: POST /api/auth/login → {email, password} → verify hash → JWT token
+- Token: Bearer token sent in Authorization header for all protected routes
+- Storage: JWT stored in localStorage as `lt_token`, user object as `lt_user`
+- Middleware: server/middleware/auth.js verifies JWT on every protected route
+- Per-user isolation: All user_problems rows are scoped by user_id
+  All localStorage keys are prefixed with `u{userId}_` to prevent data leakage
+  between accounts on the same browser
+
+**Login/Logout Flow:**
+1. On login → save token & user to localStorage → sync progress from server
+2. On logout → clearUserCache() removes ALL `u{userId}_*` keys → remove token & user
+3. On re-login → fresh sync, fresh daily queues, no stale data carryover
+
+---
+
+## 3. Bracket System
+
+**Bracket 1 — Unsolved**
+Every problem starts here. You added it but haven't solved it even once.
+- No score, no revision date
+- Sits here until you click "Mark as Solved"
+- A problem returns here if you score 0 twice in a row
+
+**Bracket 2 — Revision Phase**
+Once you mark a problem solved (even once), it lives here permanently unless
+ejected by double Score-0.
+- Gets scored (0–6) on first submission
+- Gets a next_revision_date based on effective score
+- Appears in daily queue when due date is today or earlier
+- Score can go UP or DOWN on each attempt — that is the entire point
+
+---
+
+## 4. The 7-Label Score System (0–6)
+
+Score is determined by two inputs: hint count (you report) + distinct method count
+(LLM verifies).
+
+| Score | Condition                              | Meaning                    | SRS Speed       |
+|-------|----------------------------------------|----------------------------|-----------------|
+| 6     | 3+ distinct methods, includes optimal  | Mastered multiple approaches| Slowest gaps   |
+| 5     | 2 methods, at least 1 optimal          | Strong understanding       | Long gaps       |
+| 4     | 1 optimal method OR 2 methods neither  | Good but not complete      | Medium-long     |
+| 3     | 1 method, brute force only             | Solved but not efficiently | Medium gaps     |
+| 2     | 0 methods solved, 1 hint used          | Needed a nudge             | Short gaps      |
+| 1     | 0 methods solved, 2 hints used         | Struggled significantly    | Very short gaps |
+| 0     | 3+ hints or failed entirely            | Could not solve            | Next day always |
+
+**Current Implementation (hint-based only, LLM optional):**
+The current scheduler uses a simplified 0–3 scale:
+  - 0 hints → score 3 (solid recall)
+  - 1 hint  → score 2 (reasonable)
+  - 2 hints → score 1 (shaky)
+  - 3+ hints → score 0 (failed)
+
+When LLM (Gemini) is available, the full 0–6 scale is used.
+
+---
+
+## 5. Effective Score Algorithm
+
+Raw score per attempt is not used directly for scheduling. Each new score is
+blended with previous history to produce an "effective score."
+
+```
+attempt 1 (first revision ever):
+  effective_score = current_score
+
+attempt 2:
+  effective_score = (prev_effective × 0.4) + (current_score × 0.6)
+
+attempt 3 and beyond:
+  effective_score = (prev_effective × 0.35) + (current_score × 0.65)
+```
+
+Current performance carries more weight (60–65%) than history (35–40%). Scores
+can go up AND down. The effective score is a float (e.g. 4.2) and gets rounded
+to the nearest integer to look up the interval table.
+
+---
+
+## 6. Revision Interval Table
+
+Days until next revision, based on rounded effective score and attempt count.
+
+| Score | 1st Revision | 2nd | 3rd | 4th+ |
+|-------|-------------|-----|-----|------|
+| 3     | 7 days      | 14  | 30  | 60   |
+| 2     | 3 days      | 7   | 14  | 28   |
+| 1     | 1 day       | 3   | 7   | 14   |
+| 0     | 1 day       | 1   | 1   | 1    |
+
+---
+
+## 7. Eject Rule (Back to Bracket 1)
+
+If Score-0 is recorded **twice in a row (consecutive)**, the problem is ejected
+back to Bracket 1.
+
+- Score-0 → Score-3 → Score-0: NOT ejected (not consecutive)
+- Score-0 → Score-0: EJECTED
+- Attempt is still logged in history after ejection
+- Problem fully resets: attempt_count = 0, effective_score = null, bracket = 1
+
+---
+
+## 8. Daily Queue Algorithm
+
+**Revision Queue:**
+Every day, the system selects problems for revision up to the user's configured
+`revisionPerDay` setting (default: 2).
+
+Step 1 — Pool: Collect all Bracket 2 problems where next_revision_date ≤ today.
+Step 2 — Sort by priority:
+  1. Consecutive zeros first (most urgent)
+  2. Category priority (Arrays & Hashing = highest, Bit Manipulation = lowest)
+  3. Most overdue (earliest due date wins ties)
+Step 3 — Difficulty mix rule: The 2 selected problems follow pairing rules:
+  Allowed: Easy+Medium, Easy+Hard, Medium+Medium, Medium+Hard
+  Not allowed: Easy+Easy (unless only Easy available), Hard+Hard
+
+**Daily Lock:**
+- Revision queue is locked per day (server-synced snapshot `daily_revision`)
+- Once locked, solving a problem removes it from view but doesn't refill
+- New problems only appear the next day
+- A settings change (e.g., changing revision count) updates the snapshot fingerprint and regenerates the queue.
+
+**Unsolved Queue:**
+Each day, the system schedules `unsolvedPerDay` problems from the joined series.
+- Problems are picked sequentially from the user's chosen starting topic downward
+- The active list persists across days via a server-synced snapshot (`daily_unsolved`)
+- On a new day: carry over unsolved + top up to quota
+- Same day: solving removes from view, NO refill
+- STRICT quota: never show more than `settings.unsolvedPerDay`
+- Mid-day Topic Change: The daily snapshot has a fingerprint of (count + topic). Changing the topic immediately invalidates the fingerprint and regenerates the daily list.
+- Multi-Device: Snapshots sync to the server, so logging in from another device sees the exact same daily problems without duplicate regeneration.
+
+---
+
+## 9. Settings System
+
+Settings are stored per-user in both localStorage and server (user_data table).
+
+**Fields:**
+```json
+{
+  "unsolvedPerDay": 2,          // Number of unsolved problems per day (1–10)
+  "revisionPerDay": 2,          // Number of revision problems per day (1–10)
+  "unsolvedStartTopic": "",     // Starting topic for unsolved queue (e.g., "Linked List")
+  "revisionStartTopic": ""      // Starting topic for revision queue
+}
+```
+
+**Dynamic Settings Behavior:**
+Settings changes apply IMMEDIATELY for all users. If you change your unsolved/day count or topic mid-day, the system detects a fingerprint mismatch in your daily snapshot and immediately regenerates the queued problems.
+There is NO 5-minute delay — the system relies on the snapshot fingerprint to safely apply changes right away.
+
+**Topic Selection:**
+- Users can select a starting topic for unsolved and revision queues SEPARATELY
+- Default: first topic in the joined series (e.g., "Arrays & Hashing" for NeetCode)
+- When changed (e.g., to "Linked List"), problems are scheduled from that topic
+  all the way down through the remaining topics in order
+- Any mid-day change to the topic explicitly regenerates that day's problems from the new topic.
+- The order follows the series' category structure
+
+---
+
+## 10. Score Feature (Gamification)
+
+A score counter displayed in the navbar (⚡ badge, top-right corner).
+
+**Rules:**
+- +1 for every problem solved (unsolved → solved) or revised
+- Score displayed in green when positive, red when negative
+- Score can go negative
+
+**Daily Penalty:**
+- Checked once per day on first app load
+- If yesterday's total solves < floor((unsolvedPerDay + revisionPerDay) / 2):
+  - Penalty: score -= floor((unsolvedPerDay + revisionPerDay) / 2)
+- Penalty is tracked per-day to prevent duplicate application
+- Stored in server via `saveProgress('score', value)`
+
+---
+
+## 11. Category Priority Order
+
+Based on the NeetCode roadmap. Lower number = higher priority in queue selection.
+
+ 1. Arrays & Hashing
+ 2. Two Pointers
+ 3. Sliding Window
+ 4. Stack
+ 5. Binary Search
+ 6. Linked List
+ 7. Trees
+ 8. Heap / Priority Queue
+ 9. Backtracking
+10. Tries
+11. Graphs
+12. Advanced Graphs
+13. 1-D Dynamic Programming
+14. 2-D Dynamic Programming
+15. Greedy
+16. Intervals
+17. Math & Geometry
+18. Bit Manipulation
+
+---
+
+## 12. Series System
+
+Users join a curated problem series. Three series are available:
+
+1. **NeetCode** (🚀) — Modes: 150 or 250 problems
+2. **Striver SDE Sheet** (🔥) — ~180 problems
+3. **Blind 75** (👁️) — 75 most frequently asked
+
+Each series has categories → problems in sequence. Joining a series:
+- Saves to `joined_series` in both localStorage and server
+- Dashboard's unsolved queue pulls from the joined series only
+- Series page shows all problems with solved/unsolved status via green dots and
+  line-through text
+
+**Cross-page sync:**
+- Series page reads solved status from AppDataContext (shared with Dashboard)
+- Solving on Dashboard → green dot and strikethrough appear on Series page instantly
+- Solving on Series page → Dashboard stats and streak update instantly
+
+---
+
+## 13. Streak System
+
+Tracks daily problem-solving activity in a GitHub-style contribution calendar.
+
+**Data Structure:** `{ "2026-04-13": 3, "2026-04-12": 5, ... }`
+- Each key is a date string, value is number of problems solved/revised that day
+- Stored in localStorage AND synced to server via `saveProgress('streak', data)`
+
+**Calendar Display:**
+- Shows 6 months of data in a heatmap grid
+- Color intensity based on solve count (more solves = brighter green)
+- Today's cell has an accent border
+- Auto-scrolls to show the most recent months
+
+**Stats displayed alongside:**
+- ProgressRing: Donut chart showing score bracket distribution (0–6)
+- EffectiveScoreGauge: Circular gauge showing average effective score (0–100%)
+
+---
+
+## 14. Data Sync & Cross-Device Support
+
+**Server-side persistence (user_data table):**
+| Key            | Value                        | Purpose                        |
+|----------------|------------------------------|--------------------------------|
+| settings       | {unsolvedPerDay, ...}        | User preferences               |
+| joined_series  | {seriesId, mode}             | Active series                  |
+| streak         | {date: count, ...}           | Streak calendar data           |
+| solved_map     | {key: true, ...}            | Series progress map            |
+| score          | number                       | Gamification score             |
+| daily_unsolved | {date, ids, fingerprint}     | Unsolved queue snapshot        |
+| daily_revision | {date, ids, fingerprint}     | Revision queue snapshot        |
+
+**Sync flow:**
+1. On login → `syncProgressFromServer()` → server data overwrites localStorage
+2. On every write → data saved to localStorage AND fire-and-forget PUT to server
+3. Server is source of truth; localStorage is a fast local cache
+
+**Per-user isolation:**
+- ALL localStorage keys prefixed with `u{userId}_` (e.g., `u3_lt_settings`)
+- On logout → `clearUserCache()` removes ALL keys with that prefix
+- This prevents data leaking between accounts on the same browser
+
+---
+
+## 15. AJAX-like Instant Updates (Real-time UI)
+
+The app uses a centralized data context (`AppDataContext`) for live updates.
+
+**Mechanism:**
+- `AppDataProvider` wraps the entire app inside the router
+- Polls server every 10 seconds for fresh data (problems, queue, stats)
+- Also refreshes on tab visibility change (user returns to tab)
+- Components call `useRefresh()` after any mutation for instant update
+
+**What updates instantly:**
+- Streak calendar — new solve appears immediately
+- Score badge — increments on solve, no page reload needed
+- Series page — solved problems turn green/strikethrough immediately
+- Dashboard — solved unsolved items fade out instantly
+- Progress ring — score distribution updates on revision completion
+- Navbar sync dot — shows yellow during fetch, green when synced
+
+**Optimistic Updates:**
+- Dashboard unsolved: clicking "Mark Solved" immediately marks as solved in local
+  state (optimisticSolved Set), then fires backend calls in background
+- If backend fails, optimistic state is rolled back
+- This eliminates the old double-click issue
+
+---
+
+## 16. LLM Role (Gemini 2.0 Flash)
+
+The LLM has one job: given N solutions pasted by you for a single problem,
+determine how many are truly distinct approaches.
+
+**What "distinct" means:**
+- Different core algorithm (HashMap vs Two Pointers = distinct)
+- Different time or space complexity (O(n²) brute vs O(n) optimal = distinct)
+- Same algorithm rewritten differently = NOT distinct
+- Same approach with different variable names = NOT distinct
+
+**LLM also returns per solution:**
+- Approach name (e.g. "Sliding Window", "Binary Search")
+- Time and space complexity
+- Whether it is optimal (true/false)
+
+**Exact JSON contract the LLM must return:**
+```json
+{
+  "distinct_methods": 2,
+  "solutions": [
+    {
+      "index": 1,
+      "approach_name": "HashMap",
+      "time_complexity": "O(n)",
+      "space_complexity": "O(n)",
+      "is_optimal": true
+    },
+    {
+      "index": 2,
+      "approach_name": "Brute Force Nested Loop",
+      "time_complexity": "O(n²)",
+      "space_complexity": "O(1)",
+      "is_optimal": false
+    }
+  ],
+  "duplicates": [],
+  "summary": "Two genuinely distinct approaches submitted."
+}
+```
+
+LLM is skipped entirely if hint_count >= 3 since score is already 0.
+LLM is OPTIONAL — app works without API key (score from hints only).
+
+---
+
+## 17. Database Schema (SQLite — 5 tables)
+
+**Table: users**
+```sql
+id            INTEGER PRIMARY KEY AUTOINCREMENT
+username      TEXT    NOT NULL UNIQUE
+email         TEXT    NOT NULL UNIQUE
+password_hash TEXT    NOT NULL
+created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+```
+
+**Table: user_data** (cross-device sync key-value store)
+```sql
+user_id    INTEGER NOT NULL
+key        TEXT    NOT NULL        -- 'settings', 'joined_series', 'streak', 'solved_map', 'score'
+value      TEXT    NOT NULL DEFAULT '{}'
+updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+PRIMARY KEY (user_id, key)
+```
+
+**Table: problems** (shared catalogue)
+```sql
+id           INTEGER PRIMARY KEY AUTOINCREMENT
+leetcode_id  INTEGER UNIQUE       -- LeetCode problem number (e.g. 1 for Two Sum)
+name         TEXT NOT NULL
+difficulty   TEXT NOT NULL         -- 'Easy' | 'Medium' | 'Hard'
+category     TEXT NOT NULL         -- 'Arrays & Hashing', etc.
+leetcode_url TEXT NOT NULL
+created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+```
+
+**Table: user_problems** (SRS state per user per problem)
+```sql
+id                      INTEGER PRIMARY KEY AUTOINCREMENT
+user_id                 INTEGER NOT NULL DEFAULT 0
+problem_id              INTEGER NOT NULL REFERENCES problems(id)
+bracket                 INTEGER NOT NULL DEFAULT 1   -- 1=unsolved, 2=revision
+current_effective_score REAL                         -- 0.0 to 6.0, null if never attempted
+attempt_count           INTEGER NOT NULL DEFAULT 0
+consecutive_zero_count  INTEGER NOT NULL DEFAULT 0
+next_revision_date      TEXT                         -- ISO date, null if bracket 1
+added_at                TEXT NOT NULL DEFAULT (datetime('now'))
+UNIQUE INDEX idx_up_user_problem ON (user_id, problem_id)
+```
+
+**Table: attempts** (immutable history)
+```sql
+id                    INTEGER PRIMARY KEY AUTOINCREMENT
+user_problem_id       INTEGER NOT NULL REFERENCES user_problems(id)
+score                 INTEGER NOT NULL    -- 0-6 (or 0-3 if hint-only)
+hint_count            INTEGER NOT NULL    -- 0, 1, 2, or 3 (3 means 3+)
+distinct_methods      INTEGER             -- LLM verified count
+solutions_pasted      TEXT                -- raw code pasted
+llm_feedback          TEXT                -- JSON string
+effective_score_after REAL
+attempted_at          TEXT NOT NULL DEFAULT (datetime('now'))
+```
+
+---
+
+## 18. API Endpoints (11 total)
+
+| Method | Endpoint                   | Auth | What it does                              |
+|--------|---------------------------|------|-------------------------------------------|
+| POST   | /api/auth/register        | No   | Create new account → JWT token            |
+| POST   | /api/auth/login           | No   | Login → JWT token                         |
+| GET    | /api/auth/me              | Yes  | Verify token, return user info            |
+| GET    | /api/search?q=keyword     | No   | Proxy search to LeetCode GraphQL          |
+| POST   | /api/problems             | Yes  | Add problem to tracker (Bracket 1)        |
+| GET    | /api/problems             | Yes  | Get all tracked problems (filter by bracket)|
+| GET    | /api/problems/stats       | Yes  | Score bracket distribution + totals       |
+| PUT    | /api/problems/:id/solve   | Yes  | Mark as solved → move to Bracket 2        |
+| GET    | /api/problems/:id/attempts| Yes  | Full attempt history for one problem      |
+| POST   | /api/attempts             | Yes  | Submit revision: compute score, update SRS|
+| GET    | /api/queue/today          | Yes  | Today's revision problems (sorted)        |
+| GET    | /api/queue/upcoming       | Yes  | Next 7 days of scheduled revisions        |
+| GET    | /api/progress             | Yes  | All user_data keys (settings, streak, etc)|
+| PUT    | /api/progress/:key        | Yes  | Upsert a single user_data key             |
+| GET    | /api/health               | No   | Server status check                       |
+
+---
+
+## 19. Frontend Pages & Components
+
+**Pages (6):**
+
+`Login (/login)` — Split-layout auth page. Left: decorative panel with logo and
+tagline. Right: login/register form with email, password, show/hide toggle,
+Terms & Conditions checkbox for register.
+
+`Dashboard (/)` — Main view. Three sections:
+  1. StreakCalendar: 6-month contribution calendar + ProgressRing + EffectiveScoreGauge
+  2. Unsolved Today: Daily problems from joined series (capped to unsolvedPerDay)
+  3. Revision Today: Due revision problems (capped to revisionPerDay)
+
+`AllProblems (/problems)` — Two-column layout:
+  Left: Bracket 1 (unsolved). Right: Bracket 2 (revision).
+  Top: SearchBar to add new problems from LeetCode + filter buttons.
+  Mixed-hint filter shows problems solved both with and without hints.
+
+`ProblemDetail (/problems/:id)` — Full attempt history timeline for a single
+problem. Score trend. LLM feedback for each attempt.
+
+`Series (/series)` — Series selector tabs, progress bar, Today's Practice section,
+expandable category list with solved indicators (green dot + strikethrough).
+
+`Settings (/settings)` — Four sections:
+  1. Daily Problem Count: unsolved/day and revision/day (1–10 range)
+  2. Starting Topic: unsolved and revision topic selection (separate)
+  3. Join a Series: NeetCode (150/250), Striver, Blind 75
+  4. Save button
+
+**Components (9):**
+
+`Navbar` — Top sticky nav with: logo, sync dot, page links (Dashboard, Problems,
+Series, Settings), Score badge (⚡), user avatar, Sign Out button.
+
+`SearchBar` — Debounced input calling /api/search. Dropdown shows results, click
+to add to tracker.
+
+`ProblemCard` — Single problem display used in AllProblems.
+
+`BracketColumn` — Wraps problem cards for each bracket column.
+
+`TodayQueue` — Revision cards on Dashboard. Each has difficulty badge, score,
+attempt count, effective score, LeetCode link, Revise button.
+
+`RevisionModal` — Modal for submitting revision. Textarea per solution, hint
+count selector (0/1/2/3+), submit button. Multiple solutions supported.
+
+`ProgressRing` — Donut chart showing score bracket distribution. Hoverable
+segments showing count per score. Center text shows solved/total ratio.
+
+`StreakCalendar` — 6-month GitHub-style contribution calendar with day labels,
+month headers, legend. Wraps ProgressRing (left) and EffectiveScoreGauge (right).
+
+`ScoreBadge` — Color-coded 0-6 badge (0=red, 1–2=orange, 3=yellow, 4=lime,
+5=green, 6=emerald).
+
+---
+
+## 20. Data Flow Diagrams
+
+**Solve Unsolved Problem (Dashboard — single click):**
+```
+User clicks "Mark Solved"
+  → Optimistic: add to optimisticSolved Set (instant UI update)
+  → Increment score (+1)
+  → POST /api/problems (add to DB if not tracked)
+  → PUT /api/problems/:id/solve (move bracket 1 → 2)
+  → recordSolve() (streak +1)
+  → refresh() (global context re-fetch)
+  → On failure: rollback optimisticSolved Set
+```
+
+**Solve from Problems Page (two-step, unchanged):**
+```
+User clicks "Mark Solved" on Problem Card
+  → PUT /api/problems/:id/solve (move bracket 1 → 2)
+  → refresh() (global context re-fetch)
+```
+
+**Submit Revision:**
+```
+User opens RevisionModal → enters solutions + hints → Submit
+  → POST /api/attempts (server computes score, effective, interval)
+  → Server updates user_problems (bracket, score, next_date)
+  → Client: handleRevisionDone() removes from revision queue
+  → Locks updated queue to localStorage
+  → recordSolve() (streak +1)
+  → incrementScore(+1)
+  → refresh() (global context re-fetch)
+```
+
+**Settings Change Flow:**
+```
+User changes settings → clicks Save
+  → savePreviousSettings(currentSettings)  // backup old values
+  → saveSettings(newSettings, isFirstTime) // writes + adds timestamp
+  → setJoinedSeries(...)                   // if series changed
+  → markSetupDone()
+
+  On Dashboard load:
+    → getEffectiveSettings() checks settings_changed_at
+    → If <5 min ago AND not first-time: returns OLD settings
+    → If ≥5 min ago OR first-time: returns NEW settings
+    → Dashboard uses effective settings for queue sizes
+```
+
+---
+
+## 21. localStorage Keys Reference
+
+All keys are prefixed with `u{userId}_` for per-user isolation.
+
+| Key Pattern                                    | Type     | Purpose                            |
+|-----------------------------------------------|----------|-------------------------------------|
+| lt_user                                       | JSON     | Current user (no prefix)            |
+| lt_token                                      | string   | JWT token (no prefix)               |
+| u{id}_lt_settings                             | JSON     | User settings                       |
+| u{id}_lt_joined_series                        | JSON     | Active series {seriesId, mode}      |
+| u{id}_lt_streak_data                          | JSON     | Streak {date: count}                |
+| u{id}_lt_series_solved                        | JSON     | Series solved map                   |
+| u{id}_lt_score                                | number   | Gamification score                  |
+| u{id}_lt_setup_done                           | "true"   | Setup wizard completed flag         |
+| u{id}_lt_daily_unsolved                       | JSON     | Daily unsolved snapshot             |
+| u{id}_lt_daily_revision                       | JSON     | Daily revision snapshot             |
+| u{id}_lt_penalty_applied_{YYYY-MM-DD}         | "true"   | Score penalty already applied flag  |
+| u{id}_lt_penalty_applied_{YYYY-MM-DD}         | "true"   | Score penalty already applied flag  |
+
+---
+
+## 22. Tech Stack
+
+| Layer      | Tech                     | Why                                        |
+|------------|--------------------------|---------------------------------------------|
+| Frontend   | React 19 + Vite 8        | Fast dev, component-based, SPA              |
+| Styling    | Vanilla CSS + Tailwind   | Dark-mode-first, custom design system       |
+| Routing    | react-router-dom 7       | Client-side navigation                      |
+| Backend    | Node.js + Express 4      | Lightweight, handles proxy + LLM calls      |
+| Database   | SQLite (better-sqlite3)  | Zero setup, file-based, WAL mode            |
+| Auth       | JWT (jsonwebtoken)       | Stateless, 30-day expiry                    |
+| Passwords  | bcryptjs                 | Secure hashing, 10 rounds                   |
+| LLM        | Gemini 2.0 Flash         | Free tier: 1500 req/day, code analysis      |
+| Proxy      | server/proxy.js          | Routes around CORS from LeetCode GraphQL    |
+
+---
+
+## 23. Complete File Structure
+
+```
+leetloop/
+├── read.txt                        ← This file — complete system blueprint
+├── run.md                          ← How to run the app
+├── requirements.txt                ← System requirements & dependencies
+│
+├── server/
+│   ├── index.js                    ← Entry point, Express setup, route mounting
+│   ├── db.js                       ← SQLite connection, table creation, migrations
+│   ├── proxy.js                    ← LeetCode GraphQL proxy + category mapping
+│   ├── scheduler.js                ← SRS logic (pure functions, no DB)
+│   ├── package.json
+│   ├── .env                        ← GEMINI_API_KEY, JWT_SECRET, PORT
+│   ├── .env.example
+│   ├── middleware/
+│   │   └── auth.js                 ← JWT verification middleware
+│   └── routes/
+│       ├── auth.js                 ← Register, login, /auth/me
+│       ├── problems.js             ← CRUD for problems, mark solved, stats
+│       ├── attempts.js             ← Submit revision, scoring pipeline
+│       ├── queue.js                ← Today's queue + upcoming 7 days
+│       └── progress.js             ← User data sync (settings, streak, score)
+│
+├── client/
+│   ├── index.html                  ← SPA entry point
+│   ├── vite.config.js              ← Vite config with /api proxy to :3001
+│   ├── package.json
+│   └── src/
+│       ├── main.jsx                ← React DOM render
+│       ├── index.css               ← Complete design system (dark theme)
+│       ├── App.jsx                 ← Auth gating, setup wizard, routing
+│       ├── App.css                 ← Additional styles
+│       ├── api/
+│       │   └── index.js            ← All fetch() calls (auth, problems, queue, progress)
+│       ├── context/
+│       │   ├── AppDataContext.jsx   ← Shared data layer with polling & refresh
+│       │   └── ThemeContext.jsx     ← Theme provider
+│       ├── hooks/
+│       │   └── useSettings.js      ← Settings, streak, score, sync, per-user isolation
+│       ├── data/
+│       │   └── seriesData.js       ← NeetCode, Striver, Blind 75 problem lists
+│       ├── components/
+│       │   ├── Navbar.jsx          ← Navigation + Score badge
+│       │   ├── SearchBar.jsx       ← Problem search with LeetCode proxy
+│       │   ├── ProblemCard.jsx     ← Individual problem card
+│       │   ├── BracketColumn.jsx   ← Bracket layout wrapper
+│       │   ├── TodayQueue.jsx      ← Revision queue cards
+│       │   ├── RevisionModal.jsx   ← Multi-solution revision submission
+│       │   ├── ProgressRing.jsx    ← Score distribution donut chart
+│       │   ├── StreakCalendar.jsx   ← 6-month contribution calendar
+│       │   └── ScoreBadge.jsx      ← Color-coded score badge
+│       └── pages/
+│           ├── Login.jsx           ← Authentication (split-layout design)
+│           ├── Dashboard.jsx       ← Main view (streak, unsolved, revision)
+│           ├── AllProblems.jsx     ← Bracket 1 & 2 two-column view
+│           ├── ProblemDetail.jsx   ← Attempt history & score trend
+│           ├── Series.jsx          ← Problem series browser
+│           └── SettingsPage.jsx    ← User preferences & topic selection
+│
+└── db/
+    └── leettrack.db                ← SQLite database (auto-created)
+```
+
+---
+
+## 24. Business Logic Invariants
+
+These are the hard rules that must NEVER be violated:
+
+1. **Daily unsolved quota**: The number of unsolved problems displayed in the
+   Dashboard for any given day must NEVER exceed `settings.unsolvedPerDay`.
+   If a user solves problems, they disappear from view but are NOT replaced
+   by new ones on the same day.
+
+2. **Daily revision quota**: The number of revision problems displayed in the
+   Dashboard for any given day must NEVER exceed `settings.revisionPerDay`.
+   Once locked for the day, no new revision problems are added.
+
+3. **Single-click solve**: Clicking "Mark Solved" on the Dashboard for an
+   unsolved problem must work with ONE click. The optimistic update pattern
+   ensures immediate visual feedback before the backend calls complete.
+
+4. **Settings apply instantly**: Changing settings immediately updates the snapshot fingerprint and regenerates problems. No delays.
+
+5. **Account isolation**: Logging out and back in (or switching accounts)
+   must NEVER cause data leakage between accounts. All per-user data is
+   prefixed and cleared on logout.
+
+6. **Score integrity**: Score is +1 per solve/revise. Penalty only applies
+   once per day (on first load). Score can go negative.
+
+7. **Topic ordering & mid-day changes**: When a user selects a starting topic (e.g., "Linked List"),
+   problems are scheduled from that topic through all remaining topics in order. Changing the topic mid-day immediately updates the daily queue.
+
+8. **Multi-device sync via snapshots**: Unsolved/revision lists are safely tracked via server-synced snapshots. If a user solves 1 out of 4 problems on device A, then switches to device B, they will see exactly the same 3 remaining problems without duplicate additions.
+
+---
+
+## 25. Setup Instructions
+
+**Prerequisites:** Node.js v18+, free Gemini API key from aistudio.google.com (optional)
+
+**Server:**
+```bash
+cd server
+npm install
+cp .env.example .env
+# paste your GEMINI_API_KEY and JWT_SECRET into .env
+npm run dev
+# runs on http://localhost:3001
+```
+
+**Client:**
+```bash
+cd client
+npm install
+npm run dev
+# runs on http://localhost:5173
+```
+
+**Kill orphan processes (if port already in use):**
+```bash
+fuser -k 3001/tcp 5173/tcp
+```
+
+**Without an API key:**
+The app works fully without a Gemini key — LLM analysis will be skipped when no
+key is present. Score will be computed from hints only. You can add the key later.
+
+---
+
+## 26. Worked Example — End to End
+
+**Day 1: Adding Two Sum**
+1. Search "Two Sum" → proxy returns leetcode_id=1, difficulty=Easy, category=Arrays & Hashing
+2. Click Add → goes to Bracket 1
+3. You solve it on LeetCode → click "Mark as Solved" → moves to Bracket 2
+
+**Day 1: First revision submission**
+```
+You paste 2 solutions, report hint_count = 0
+Score logic (hint-based): 0 hints → Score 3
+Effective score: attempt_count=0 so effective = 3.0 (raw)
+Interval: score 3, attempt 0 → 7 days
+next_revision_date = today + 7 days
+Score: +1 (now total = 1)
+```
+
+**Day 8: Second revision**
+```
+You paste 1 solution, hint_count = 1
+Score logic: 1 hint → Score 2
+Effective score: (3.0 × 0.4) + (2 × 0.6) = 1.2 + 1.2 = 2.4
+Rounded = 2. Interval: score 2, attempt 1 → 7 days
+next_revision_date = today + 7 days
+Score: +1 (now total = 2)
+```
+
+**Day 15: Score-0 scenario**
+```
+You completely blank. hint_count = 3. Score = 0.
+Effective score: (2.4 × 0.35) + (0 × 0.65) = 0.84
+consecutive_zero_count = 1
+next_revision_date = tomorrow (score 0 → 1 day)
+
+Next day you blank again. Score = 0.
+consecutive_zero_count = 2 → EJECT
+Problem returns to Bracket 1. Full reset.
+```
+
+**End of Day 15 (penalty check):**
+```
+Settings: unsolvedPerDay=2, revisionPerDay=2
+Half goal = floor((2+2)/2) = 2
+If total solves that day < 2: score -= 2
+```
+
+---
+
+That's the complete system. All code is written and ready to run.
