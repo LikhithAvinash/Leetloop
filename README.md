@@ -184,7 +184,3 @@ npm run lint   # ESLint check
 ```
 
 ---
-
-## 📄 License
-
-MIT
