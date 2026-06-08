@@ -1,6 +1,7 @@
 # 🔁 LeetLoop
 
 > **Spaced-repetition DSA practice — study smarter, not harder.**
+<img width="1920" height="1080" alt="Screenshot from 2026-06-08 23-04-45" src="https://github.com/user-attachments/assets/b2bfdad8-e78e-42aa-8af2-d2feb11e7355" />
 
 LeetLoop is a full-stack web app that helps you master Data Structures & Algorithms using a spaced-repetition system (SRS). Log your attempts, track your progress across popular problem series, get AI-powered hints, and let the scheduler automatically tell you which problems to revisit and when.
 
